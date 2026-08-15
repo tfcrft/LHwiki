@@ -54,10 +54,14 @@
 
 需要 Node.js 20 或更高版本。
 
-```powershell
-pnpm install
-pnpm test
+从仓库根目录运行：
+
+```shell
+npm run setup
+npm run dev
 ```
+
+浏览器打开 <http://localhost:8787/>。测试可运行 `npm test`。初始化命令会自动生成仅供本机使用且被 Git 忽略的 `.dev.vars`；不要向其中写入生产密钥。
 
 Cloudflare 回退版本的本地开发命令和密钥样例仍保留在 `package.json`、`.dev.vars.example` 与 `wrangler.jsonc` 中。CloudBase 生产部署不要把服务器 API Key 写入源码、前端或 `.env` 文件。
 

@@ -21,10 +21,13 @@ LHwiki 是面向潞河校园的轻量共建手册：公开阅读、校内学号�
 
 ## 本地测试
 
-```powershell
-cd LHwiki-source-20260808
-pnpm install
-pnpm test
+在仓库根目录执行：
+
+```shell
+npm run setup
+npm run dev
 ```
+
+浏览器打开 <http://localhost:8787/>。测试可运行 `npm test`。本地登录需要 `LHwiki-source-20260808/.dev.vars` 中的 `SESSION_SECRET`；该文件已被 Git 忽略，不得填入生产密钥。
 
 生产部署说明见 [`cloudbase/README.md`](LHwiki-source-20260808/cloudbase/README.md)。项目采用 MIT License。请勿将生产 API Key、学生学号、未公开投稿、审核记录或 `backup/` 数据上传到公开仓库。
