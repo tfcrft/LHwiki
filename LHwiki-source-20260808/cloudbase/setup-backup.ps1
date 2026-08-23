@@ -4,6 +4,7 @@ param(
   [SecureString]$ApiKey,
   [datetime]$ApiKeyExpiresAt = '2027-08-08T00:00:00+08:00',
   [string]$DailyAt = '03:30',
+  [switch]$EnableScheduledTask,
   [switch]$SkipScheduledTask
 )
 
@@ -26,7 +27,8 @@ $credential | Export-Clixml -LiteralPath $CredentialPath
   configuredAt = (Get-Date).ToString('o')
 } | ConvertTo-Json | Set-Content -LiteralPath $SettingsPath -Encoding UTF8
 
-if (-not $SkipScheduledTask) {
+if ($EnableScheduledTask -and $SkipScheduledTask) { throw '不能同时指定 -EnableScheduledTask 和 -SkipScheduledTask。' }
+if ($EnableScheduledTask -and -not $SkipScheduledTask) {
   $time = [datetime]::ParseExact($DailyAt, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
   $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$BackupScript`""
   $trigger = New-ScheduledTaskTrigger -Daily -At $time
@@ -36,7 +38,7 @@ if (-not $SkipScheduledTask) {
 }
 
 & $BackupScript -ProjectRoot $ProjectRoot
-if ($SkipScheduledTask) {
+if (-not $EnableScheduledTask -or $SkipScheduledTask) {
   Write-Host '已配置本机手动备份；未创建每日计划任务。'
 } else {
   Write-Host '已启用每日自动备份：LHwiki-CloudBase-Backup'

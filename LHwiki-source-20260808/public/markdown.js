@@ -1,4 +1,4 @@
-import { normalizeBlocks } from './editor.js?v=20260815-markdown';
+import { normalizeBlocks } from './editor.js?v=20260815-v081';
 
 const CODE_FENCE = /^```([^\n`]*)\n([\s\S]*)\n```$/;
 const INLINE_PATTERN = /(\*\*[^*\n]+\*\*|~~[^~\n]+~~|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|\*[^*\n]+\*)/g;

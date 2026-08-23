@@ -4,6 +4,7 @@ const http = require('node:http');
 const { existsSync, readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { createPgStore } = require('./pg-store.cjs');
+const { loadPublicSnapshot } = require('./public-snapshot.cjs');
 const {
   ADMIN_LOGIN_ID,
   CONTENT_TYPES,
@@ -21,10 +22,21 @@ const {
 
 const COOKIE = 'campus_session';
 const VISIT_TRACKING_START = Date.parse('2026-08-10T00:00:00+08:00');
-const PUBLIC_CACHE_TTL = 2 * 60_000;
+const PUBLIC_CACHE_TTL = 6 * 60 * 60_000;
+const ARTICLE_CACHE_TTL = 6 * 60 * 60_000;
+const VISIT_TRACKING_ENABLED = false;
+const DRAFT_CLIENT_VERSION = 3;
+const EMERGENCY_MAINTENANCE = true;
+const MAINTENANCE_REVIEW_DATE = '2026-09-07';
 const encoder = new TextEncoder();
 const migrationPath = join(__dirname, 'migration-data.private.json');
 const seed = JSON.parse(readFileSync(existsSync(migrationPath) ? migrationPath : join(__dirname, 'seed-data.json'), 'utf8'));
+// Public routes intentionally load only this allowlisted snapshot. The fallback
+// reads the checked-in seed, never migration-data.private.json or PostgreSQL.
+const publicSnapshot = loadPublicSnapshot({
+  snapshotPath: join(__dirname, 'public-snapshot.json'),
+  seedPath: join(__dirname, 'seed-data.json')
+});
 if (!process.env.TCB_ENV || !process.env.CLOUDBASE_APIKEY) {
   throw new Error('Missing TCB_ENV or CLOUDBASE_APIKEY');
 }
@@ -42,6 +54,8 @@ const {
 });
 let seedPromise;
 let publicCache = null;
+let publicCachePromise = null;
+const articleCache = new Map();
 const mutationWindows = new Map();
 
 function now() {
@@ -56,29 +70,38 @@ function withoutId(document) {
 
 function invalidatePublicCache() {
   publicCache = null;
+  publicCachePromise = null;
+  articleCache.clear();
 }
 
 async function readPublicBootstrap() {
   if (publicCache && Date.now() - publicCache.savedAt < PUBLIC_CACHE_TTL) return publicCache.value;
-  const [sections, articles, contributors, teacherAdditions] = await Promise.all([
-    queryDocuments('sections'),
-    queryDocuments('articles'),
-    queryDocuments('contributors'),
-    queryDocuments('teacher_additions')
-  ]);
-  sections.sort((a, b) => a.sort_order - b.sort_order);
-  sortByDate(articles, 'published_at');
-  const publicContributors = contributors
-    .filter(item => item.approved_at)
-    .sort((a, b) => String(a.approved_at).localeCompare(String(b.approved_at)))
-    .map(item => ({ displayName: item.display_name, since: item.approved_at }));
-  const value = {
-    sections: sections.map(withoutId),
-    articles: articles.map(mapArticleSummary),
-    contributors: publicContributors,
-    teacherAdditions: teacherAdditions.map(mapTeacherAddition)
-  };
-  publicCache = { savedAt: Date.now(), value };
+  if (!publicCachePromise) publicCachePromise = (async () => {
+    const sections = publicSnapshot.sections.slice();
+    const articles = publicSnapshot.articles.map(article => ({ ...article, body_json: JSON.stringify(article.body) }));
+    const contributors = publicSnapshot.contributors.slice();
+    const teacherAdditions = publicSnapshot.teacherAdditions.slice();
+    sections.sort((a, b) => a.sort_order - b.sort_order);
+    sortByDate(articles, 'published_at');
+    const value = {
+      sections: sections.map(withoutId),
+      articles: articles.map(mapArticleSummary),
+      contributors: contributors.sort((a, b) => String(a.since).localeCompare(String(b.since))),
+      teacherAdditions
+    };
+    publicCache = { savedAt: Date.now(), value };
+    return value;
+  })().finally(() => { publicCachePromise = null; });
+  return publicCachePromise;
+}
+
+async function readPublicArticle(slug) {
+  const cached = articleCache.get(slug);
+  if (cached && Date.now() - cached.savedAt < ARTICLE_CACHE_TTL) return cached.value;
+  const article = publicSnapshot.articles.find(item => item.slug === slug);
+  const value = article ? { ...article, body_json: JSON.stringify(article.body) } : null;
+  articleCache.set(slug, { savedAt: Date.now(), value });
+  if (articleCache.size > 100) articleCache.delete(articleCache.keys().next().value);
   return value;
 }
 
@@ -158,7 +181,7 @@ async function readSession(request) {
     if (!validLoginId(data.studentId) || data.exp < Date.now()) return null;
     const stored = withoutId(await getDocument('users', data.studentId));
     if (data.studentId !== ADMIN_LOGIN_ID) {
-      return stored || {
+      return stored ? { ...stored, __persistent: true } : {
         student_id: data.studentId,
         role: 'student',
         role_locked: 0,
@@ -173,10 +196,13 @@ async function readSession(request) {
       role: 'admin',
       role_locked: 0,
       created_at: stored?.created_at || timestamp,
-      last_login_at: stored?.last_login_at || timestamp
+      last_login_at: stored?.last_login_at || timestamp,
+      __persistent: true
     };
     if (!stored || stored.role !== 'admin' || stored.role_locked !== 0) {
-      await setDocument('users', ADMIN_LOGIN_ID, protectedAdmin);
+      const persistedAdmin = { ...protectedAdmin };
+      delete persistedAdmin.__persistent;
+      await setDocument('users', ADMIN_LOGIN_ID, persistedAdmin);
     }
     return protectedAdmin;
   } catch {
@@ -204,7 +230,16 @@ function checkMutationOrigin(request) {
   }
 }
 
+const requestBodies = new WeakMap();
+
 async function readJson(request) {
+  if (requestBodies.has(request)) return requestBodies.get(request);
+  const pending = readJsonOnce(request);
+  requestBodies.set(request, pending);
+  return pending;
+}
+
+async function readJsonOnce(request) {
   const chunks = [];
   let length = 0;
   for await (const chunk of request) {
@@ -229,8 +264,9 @@ function publicUser(user) {
 }
 
 async function ensurePersistentUser(user) {
+  if (user?.__persistent) return user;
   const existing = withoutId(await getDocument('users', user.student_id));
-  if (existing) return existing;
+  if (existing) return { ...existing, __persistent: true };
   const timestamp = now();
   const persistent = {
     ...user,
@@ -238,7 +274,7 @@ async function ensurePersistentUser(user) {
     last_login_at: user.last_login_at || timestamp
   };
   await setDocument('users', user.student_id, persistent);
-  return persistent;
+  return { ...persistent, __persistent: true };
 }
 
 function mapArticle(row) {
@@ -248,7 +284,7 @@ function mapArticle(row) {
 
 function mapArticleSummary(row) {
   const clean = withoutId(row);
-  const { body_json, ...summary } = clean;
+  const { body_json, body, ...summary } = clean;
   return summary;
 }
 
@@ -430,22 +466,25 @@ async function route(request) {
   if (!['GET', 'HEAD'].includes(method) && !checkMutationOrigin(request)) return error('请求来源无效', 403);
 
   if (method === 'GET' && path === '/api/health') {
-    await queryDocuments('sections', null, 1);
     return result({
       ok: true,
-      database: 'ready',
+      database: EMERGENCY_MAINTENANCE ? 'suspended-by-application' : 'deferred',
+      maintenance: EMERGENCY_MAINTENANCE,
+      reviewDate: EMERGENCY_MAINTENANCE ? MAINTENANCE_REVIEW_DATE : null,
       platform: 'cloudbase',
       region: process.env.TENCENTCLOUD_REGION || 'ap-shanghai'
     });
   }
 
-  await ensureSeed();
-
   if (method === 'GET' && path === '/api/visits') {
+    if (EMERGENCY_MAINTENANCE) return result({ total: null, trackingStartedAt: '2026-08-10', paused: true, maintenance: true });
+    if (!VISIT_TRACKING_ENABLED) return result({ total: null, trackingStartedAt: '2026-08-10', paused: true });
     return result({ total: await readVisitCount(), trackingStartedAt: '2026-08-10' });
   }
 
   if (method === 'POST' && path === '/api/visits') {
+    if (EMERGENCY_MAINTENANCE) return result({ trackingStartedAt: '2026-08-10', counted: false, paused: true, maintenance: true });
+    if (!VISIT_TRACKING_ENABLED) return result({ trackingStartedAt: '2026-08-10', counted: false, paused: true });
     const limited = enforceMutationRate(request, 'visit', 120)
       || enforceMutationRate(request, 'visit-sustained', 600, 15 * 60_000);
     if (limited) return limited;
@@ -465,16 +504,43 @@ async function route(request) {
     return result(
       await readPublicBootstrap(),
       200,
-      { 'cache-control': 'public, max-age=300, stale-while-revalidate=3600' }
+      { 'cache-control': 'public, max-age=21600, stale-while-revalidate=604800' }
     );
   }
 
   if (method === 'GET' && path.startsWith('/api/articles/')) {
     const slug = decodeURIComponent(path.slice('/api/articles/'.length));
-    const article = await getDocument('articles', slug);
+    const article = await readPublicArticle(slug);
     return article
-      ? result({ article: mapArticle(article) })
+      ? result({ article: mapArticle(article) }, 200, { 'cache-control': 'public, max-age=21600, stale-while-revalidate=604800' })
       : error('没有找到这篇内容', 404);
+  }
+
+  if (EMERGENCY_MAINTENANCE) {
+    if (method === 'GET' && path === '/api/session') {
+      return result({ user: null, maintenance: true, reviewDate: MAINTENANCE_REVIEW_DATE });
+    }
+    if (method === 'POST' && path === '/api/auth/logout') {
+      return result({ ok: true, maintenance: true }, 200, { 'set-cookie': sessionCookie('', 0) });
+    }
+    return result({
+      error: '网站正在进行资源保护维护，当前仅开放公开浏览；本机内容不会被清除',
+      maintenance: true,
+      reviewDate: MAINTENANCE_REVIEW_DATE
+    }, 503, { 'retry-after': '86400' });
+  }
+
+  const isDraftWrite = (method === 'POST' && path === '/api/drafts')
+    || (method === 'PUT' && /^\/api\/drafts\/[a-zA-Z0-9_-]+$/.test(path))
+    || (method === 'POST' && /^\/api\/drafts\/[a-zA-Z0-9_-]+\/submit$/.test(path));
+  if (isDraftWrite) {
+    const data = await readJson(request);
+    if (!Number.isSafeInteger(Number(data?.clientVersion)) || Number(data.clientVersion) < DRAFT_CLIENT_VERSION) {
+      return result({
+        error: '省流写作模式已经启用；本机内容已保留，请刷新页面后继续',
+        upgradeRequired: true
+      }, 409);
+    }
   }
 
   if (method === 'GET' && path === '/api/session') {
@@ -587,7 +653,12 @@ async function route(request) {
 
   const draftMatch = path.match(/^\/api\/drafts\/([a-zA-Z0-9_-]+)$/);
   if (draftMatch && ['PUT', 'DELETE'].includes(method)) {
-    const limited = enforceMutationRate(request, method === 'PUT' ? 'draft-save' : 'draft-delete', method === 'PUT' ? 90 : 30);
+    // Six cloud revisions per hour is enough for the five-minute idle policy
+    // while immediately containing legacy 30-second autosave tabs. Local
+    // browser recovery remains available when this returns 429.
+    const limited = method === 'PUT'
+      ? enforceMutationRate(request, 'draft-save', 6, 60 * 60_000)
+      : enforceMutationRate(request, 'draft-delete', 30);
     if (limited) return limited;
     const auth = await requireUser(request);
     if (auth.response) return auth.response;
@@ -945,7 +1016,8 @@ const server = http.createServer(async (request, response) => {
     send(response, await route(request));
   } catch (err) {
     console.error(err);
-    send(response, result({ error: '服务器暂时无法处理请求', diagnostic: safeDiagnostic(err) }, 500));
+    const status = err?.code === 'PG_REQUEST_BUDGET_EXCEEDED' || err?.status === 503 ? 503 : err?.status === 429 ? 429 : 500;
+    send(response, result({ error: status === 503 ? '数据库当前请求过多，请稍后重试' : '服务器暂时无法处理请求', diagnostic: safeDiagnostic(err) }, status));
   }
 });
 

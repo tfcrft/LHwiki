@@ -1,8 +1,7 @@
-// Local persistence stays near-instant; cloud writes are coalesced until the
-// writer pauses, which keeps the editor responsive without charging per keypress.
-const SAVE_DELAY = 4000;
+// Low-resource mode never schedules cloud writes. Editing is recovered from
+// localStorage; only an explicit Save or Submit may touch PostgreSQL.
+const DRAFT_CLIENT_VERSION = 3;
 const LOCAL_DELAY = 220;
-const RETRY_DELAYS = [2000, 5000, 15000, 30000];
 
 function storageKey(userId, draftKey) {
   return `lhwiki:draft:${encodeURIComponent(userId)}:${encodeURIComponent(draftKey)}`;
@@ -32,6 +31,26 @@ export function readLocalDraft(userId, draftKey) {
   }
 }
 
+export function listLocalDrafts(userId = null) {
+  const drafts = [];
+  try {
+    const prefix = 'lhwiki:draft:';
+    for (let index = 0; index < localStorage.length; index++) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(prefix)) continue;
+      const remainder = key.slice(prefix.length);
+      const separator = remainder.indexOf(':');
+      if (separator < 0) continue;
+      const storedUserId = decodeURIComponent(remainder.slice(0, separator));
+      if (userId && storedUserId !== userId) continue;
+      const draftKey = decodeURIComponent(remainder.slice(separator + 1));
+      const value = readLocalDraft(storedUserId, draftKey);
+      if (value) drafts.push({ ...value, userId: storedUserId, draftKey });
+    }
+  } catch { /* private mode can disable storage */ }
+  return drafts.sort((left, right) => Date.parse(right.savedAt || 0) - Date.parse(left.savedAt || 0));
+}
+
 export function clearLocalDraft(userId, draftKey) {
   try { localStorage.removeItem(storageKey(userId, draftKey)); } catch { /* private mode can disable storage */ }
 }
@@ -47,7 +66,7 @@ export function clearUserLocalDrafts(userId) {
 }
 
 export class DraftManager {
-  constructor({ api, userId, draftKey, targetType = 'new', targetId = null, draft = null, onState = () => {}, onConflict = () => {} }) {
+  constructor({ api, userId, draftKey, targetType = 'new', targetId = null, draft = null, warnBeforeUnload = false, onState = () => {}, onConflict = () => {} }) {
     this.api = api;
     this.userId = userId;
     this.draftKey = draft?.draftKey || draftKey;
@@ -69,12 +88,24 @@ export class DraftManager {
     this.retryIndex = 0;
     this.conflicted = false;
     this.removing = false;
+    this.warnBeforeUnload = warnBeforeUnload;
     this.lastState = 'saved';
     this.channel = this.createChannel();
-    this.onlineHandler = () => this.sequence > this.savedSequence && this.saveNow();
+    this.trailingSaveRequested = false;
+    this.autoRetryBlocked = false;
+    this.onlineHandler = () => {
+      if (this.sequence > this.savedSequence) this.setState('dirty', '已保存在本机；点击“立即保存”可同步云端');
+    };
     window.addEventListener('online', this.onlineHandler);
     this.pagehideHandler = () => this.persistLocal(true);
     window.addEventListener('pagehide', this.pagehideHandler);
+    this.beforeUnloadHandler = event => {
+      this.persistLocal(true);
+      if (!this.warnBeforeUnload || this.sequence < 1) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', this.beforeUnloadHandler);
     this.setState('saved', this.updatedAt ? `已保存于 ${this.formatTime(this.updatedAt)}` : '尚未开始保存');
   }
 
@@ -115,7 +146,6 @@ export class DraftManager {
       this.id = this.id || local.draftId || null;
       this.revision = this.revision || local.revision || null;
       this.setState('dirty', '已恢复这台设备上较新的内容');
-      queueMicrotask(() => this.saveNow());
       return clone(this.snapshot);
     }
     this.snapshot = clone(this.snapshot || initialSnapshot);
@@ -130,11 +160,9 @@ export class DraftManager {
     this.snapshot = nextSnapshot;
     this.snapshotFingerprint = nextFingerprint;
     this.sequence += 1;
-    this.setState(navigator.onLine ? 'dirty' : 'offline', navigator.onLine ? '有修改尚未保存' : '离线：已保存在这台设备');
+    this.setState(navigator.onLine ? 'dirty' : 'offline', navigator.onLine ? '已自动保存在本机；云端需手动保存' : '离线：已保存在这台设备');
     clearTimeout(this.localTimer);
     this.localTimer = setTimeout(() => this.persistLocal(), LOCAL_DELAY);
-    clearTimeout(this.timer);
-    if (!this.conflicted && navigator.onLine) this.timer = setTimeout(() => this.saveNow(), SAVE_DELAY);
     return true;
   }
 
@@ -155,18 +183,26 @@ export class DraftManager {
     }
   }
 
-  async saveNow() {
+  async saveNow({ automatic = false } = {}) {
     clearTimeout(this.timer);
     clearTimeout(this.retryTimer);
     this.persistLocal();
     if (!this.snapshot || this.conflicted) return null;
+    if (automatic && this.autoRetryBlocked) {
+      this.setState('failed', '云端自动保存已暂停，本机副本仍保留；可手动重试');
+      return null;
+    }
     if (!navigator.onLine) {
       this.setState('offline', '离线：已保存在这台设备');
       return null;
     }
     if (this.saving) {
+      if (this.sequence > this.savedSequence) this.trailingSaveRequested = true;
       await this.saving;
-      if (this.sequence > this.savedSequence) return this.saveNow();
+      if (this.trailingSaveRequested) {
+        this.trailingSaveRequested = false;
+        return this.saveNow({ automatic });
+      }
       return null;
     }
     const sendingSequence = this.sequence;
@@ -184,11 +220,11 @@ export class DraftManager {
     try {
       const wasNew = !this.id;
       let response = wasNew
-        ? await this.api('/api/drafts', { method: 'POST', body: { draftKey: this.draftKey, targetType: this.targetType, targetId: this.targetId, snapshot } })
-        : await this.api(`/api/drafts/${encodeURIComponent(this.id)}`, { method: 'PUT', body: { expectedRevision: this.revision, snapshot } });
+        ? await this.api('/api/drafts', { method: 'POST', body: { clientVersion: DRAFT_CLIENT_VERSION, draftKey: this.draftKey, targetType: this.targetType, targetId: this.targetId, snapshot } })
+        : await this.api(`/api/drafts/${encodeURIComponent(this.id)}`, { method: 'PUT', body: { clientVersion: DRAFT_CLIENT_VERSION, expectedRevision: this.revision, snapshot } });
       let draft = response.draft;
       if (wasNew && JSON.stringify(this.snapshotFromDraft(draft)) !== JSON.stringify(snapshot)) {
-        response = await this.api(`/api/drafts/${encodeURIComponent(draft.id)}`, { method: 'PUT', body: { expectedRevision: draft.revision, snapshot } });
+        response = await this.api(`/api/drafts/${encodeURIComponent(draft.id)}`, { method: 'PUT', body: { clientVersion: DRAFT_CLIENT_VERSION, expectedRevision: draft.revision, snapshot } });
         draft = response.draft;
       }
       this.id = draft.id;
@@ -197,6 +233,7 @@ export class DraftManager {
       this.updatedAt = draft.updatedAt;
       this.savedSequence = Math.max(this.savedSequence, sendingSequence);
       this.retryIndex = 0;
+      this.autoRetryBlocked = false;
       this.channel?.postMessage({ revision: this.revision, updatedAt: this.updatedAt });
       this.persistLocal();
       if (this.sequence === this.savedSequence) this.setState('saved', `已保存 ${this.formatTime(this.updatedAt)}`);
@@ -215,9 +252,12 @@ export class DraftManager {
         this.setState('conflict', '页面版本已更新，请刷新后继续编辑；本机内容仍已保留');
         return null;
       }
-      this.setState(navigator.onLine ? 'failed' : 'offline', navigator.onLine ? '云端保存失败，将自动重试' : '离线：已保存在这台设备');
-      const delay = RETRY_DELAYS[Math.min(this.retryIndex++, RETRY_DELAYS.length - 1)];
-      this.retryTimer = setTimeout(() => this.saveNow(), delay);
+      if ([429, 503].includes(error?.status)) {
+        this.autoRetryBlocked = true;
+        this.setState('failed', '云端暂时繁忙，自动保存已暂停；本机副本仍保留，可稍后手动保存');
+        return null;
+      }
+      this.setState(navigator.onLine ? 'failed' : 'offline', navigator.onLine ? '云端保存失败，本机副本仍保留；请稍后手动重试' : '离线：已保存在这台设备');
       return null;
     }
   }
@@ -229,7 +269,7 @@ export class DraftManager {
     if (!this.id || !this.revision) throw new Error('草稿还没有保存到云端，请重试');
     const result = await this.api(`/api/drafts/${encodeURIComponent(this.id)}/submit`, {
       method: 'POST',
-      body: { expectedRevision: this.revision }
+      body: { clientVersion: DRAFT_CLIENT_VERSION, expectedRevision: this.revision }
     });
     clearLocalDraft(this.userId, this.draftKey);
     return result;
@@ -302,5 +342,6 @@ export class DraftManager {
     this.channel?.close();
     window.removeEventListener('online', this.onlineHandler);
     window.removeEventListener('pagehide', this.pagehideHandler);
+    window.removeEventListener('beforeunload', this.beforeUnloadHandler);
   }
 }
