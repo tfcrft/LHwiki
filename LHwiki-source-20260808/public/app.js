@@ -1,10 +1,12 @@
 import { formatDate } from './date.js';
-import { BlockEditor, EDITOR_SCHEMA_VERSION, normalizeBlocks } from './editor.js?v=20260815-markdown';
+import { BlockEditor, EDITOR_SCHEMA_VERSION, normalizeBlocks } from './editor.js?v=20260822-v084';
 import { renderMath } from './math-renderer.js?v=20260813-editor-studio';
-import { DraftManager, clearLocalDraft, clearUserLocalDrafts, draftKeyFor } from './draft-manager.js?v=20260813-editor-studio';
-import { changelogPage } from './changelog.js?v=20260815-dark-markdown';
-import { blocksToMarkdown, codeFence, parseInlineMarkdown, parseMarkdown } from './markdown.js?v=20260815-markdown';
+import { DraftManager, clearLocalDraft, clearUserLocalDrafts, draftKeyFor, listLocalDrafts } from './draft-manager.js?v=20260823-v086';
+import { changelogPage } from './changelog.js?v=20260822-v084';
+import { blocksToMarkdown, codeFence, parseInlineMarkdown, parseMarkdown } from './markdown.js?v=20260815-v081';
 
+const MAINTENANCE_MODE = true;
+const MAINTENANCE_REVIEW_DATE = '2026年9月7日';
 const state = { sections: [], articles: [], contributors: [], teacherAdditions: [], drafts: [], user: null, visitCount: null, search: '', editing: null, articleEditing: null, reviewEditing: null, articleCacheBust: null, contributionPreset: null, teacherQuery: '', teacherSubject: '全部', activeDraftManager: null, activeEditor: null, forceNewDraft: false };
 const app = document.querySelector('#app');
 const loginDialog = document.querySelector('#login-dialog');
@@ -16,8 +18,9 @@ const VISIT_BROWSER_KEY = 'lhwiki:visit:browser';
 const VISIT_PENDING_KEY = 'lhwiki:visit:pending';
 const VISIT_BATCH_KEY = 'lhwiki:visit:batch';
 const VISIT_TOTAL_KEY = 'lhwiki:visit:total';
-const BOOTSTRAP_TTL = 15 * 60_000;
-const SESSION_TTL = 5 * 60_000;
+const MAINTENANCE_LOCAL_USER_KEY = 'lhwiki:maintenance-local-user';
+const BOOTSTRAP_TTL = 6 * 60 * 60_000;
+const SESSION_TTL = 12 * 60 * 60_000;
 const VISIT_TOTAL_TTL = 6 * 60 * 60_000;
 const VISIT_FLUSH_DELAY = 20_000;
 const VISIT_BATCH_MAX = 20;
@@ -33,7 +36,10 @@ const esc = value => String(value ?? '').replace(/[&<>'"]/g, char => ({ '&': '&a
 
 async function api(path, options = {}) {
   const method = String(options.method || 'GET').toUpperCase();
-  const maxAttempts = method === 'GET' ? 2 : 1;
+  // Backend PostgreSQL failures are deliberately surfaced without retry.
+  // Retrying the whole cloud function from the browser would multiply cold
+  // starts and database wakeups, so low-resource mode uses one attempt.
+  const maxAttempts = 1;
   let response;
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -115,6 +121,7 @@ async function refreshBootstrap() {
 }
 
 async function loadSession() {
+  if (MAINTENANCE_MODE) return readCache(sessionStorage, SESSION_CACHE_KEY, SESSION_TTL) || { user: null, maintenance: true };
   const cached = readCache(sessionStorage, SESSION_CACHE_KEY, SESSION_TTL);
   if (cached) return cached;
   const session = await api('/api/session');
@@ -124,6 +131,20 @@ async function loadSession() {
 
 function cacheSession(user) {
   writeCache(sessionStorage, SESSION_CACHE_KEY, { user });
+}
+
+function maintenanceLocalUserId() {
+  if (state.user?.studentId) return state.user.studentId;
+  try {
+    let id = localStorage.getItem(MAINTENANCE_LOCAL_USER_KEY);
+    if (!id) {
+      id = `local-${crypto.randomUUID()}`;
+      localStorage.setItem(MAINTENANCE_LOCAL_USER_KEY, id);
+    }
+    return id;
+  } catch {
+    return 'local-maintenance';
+  }
 }
 
 function toast(message) {
@@ -176,18 +197,18 @@ function shell(content) {
         <label class="search"><span>⌕</span><input id="search" value="${esc(state.search)}" placeholder="搜索老师、课程、社团或经验" aria-label="搜索"></label>
         <div class="actions">
           ${themeControl()}
-          <a class="button primary" href="#/contribute"><span>＋</span><span class="contribute-label">提交内容</span></a>
+          <a class="button primary" href="#/contribute" ${MAINTENANCE_MODE ? 'aria-disabled="true" title="资源保护维护中"' : ''}><span>＋</span><span class="contribute-label">提交内容</span></a>
           ${userControl()}
         </div>
       </header>
-      <div class="content">${content}</div>
+      <div class="content">${maintenanceBanner()}${content}</div>
     </main>
   </div>`;
   bindShell();
 }
 
 function userControl() {
-  if (!state.user) return `<button class="button" data-login>登入</button>`;
+  if (!state.user) return `<button class="button" data-login ${MAINTENANCE_MODE ? 'aria-disabled="true" title="资源保护维护中"' : ''}>登入</button>`;
   return `<div class="user-menu"><button class="avatar" id="user-menu-button" aria-label="账号菜单">${state.user.role === 'admin' ? '管' : state.user.role === 'reviewer' ? '审' : '同'}</button>
     <div class="menu" id="user-menu" hidden><div class="menu-info">${esc(state.user.maskedId)} · ${roleName(state.user.role)}</div>
       <a href="#/mine">我的投稿</a>
@@ -196,11 +217,23 @@ function userControl() {
     </div></div>`;
 }
 
+function maintenanceBanner() {
+  if (!MAINTENANCE_MODE) return '';
+  return `<aside class="maintenance-banner" role="status"><span>资源保护维护</span><div><strong>网站近期运行不稳定，暂时停用云端上传</strong><p>编辑器仍可正常使用，文字会自动保存在当前浏览器；为防范设备或浏览器异常，建议同时复制到本机文档，或使用 Markdown 面板导出一份独立备份。请勿清除浏览器网站数据。此前已成功保存在云端的内容不会消失，维护恢复后即可重新下载。登入、云端保存、投稿、审核和后台管理预计于 ${MAINTENANCE_REVIEW_DATE} 恢复。</p></div></aside>`;
+}
+
+function maintenancePage() {
+  return `<header class="page-heading"><span class="eyebrow">TEMPORARY READ-ONLY MODE</span><h1>这项功能正在维护</h1><p>当前只开放公开目录、搜索和文章阅读。已经打开的编辑页可以继续使用并自动保存在本机；请勿刷新、关闭编辑页或清除浏览器网站数据。此前已成功保存在云端的内容不会消失，维护恢复后即可重新从云端下载。</p></header>`;
+}
+
 function roleName(role) { return ({ student: '投稿者', reviewer: '审核者', admin: '管理员' })[role] || role; }
 
 function bindShell() {
   document.querySelector('#mobile-menu')?.addEventListener('click', () => document.querySelector('#sidebar').classList.toggle('open'));
-  document.querySelectorAll('[data-login]').forEach(button => button.addEventListener('click', () => loginDialog.showModal()));
+  document.querySelectorAll('[data-login]').forEach(button => button.addEventListener('click', () => {
+    if (MAINTENANCE_MODE) return toast('资源保护维护中，预计 9 月 7 日恢复登入');
+    loginDialog.showModal();
+  }));
   const menuButton = document.querySelector('#user-menu-button');
   menuButton?.addEventListener('click', () => { const menu = document.querySelector('#user-menu'); menu.hidden = !menu.hidden; });
   const themeButton = document.querySelector('[data-theme-menu]');
@@ -424,6 +457,19 @@ function snapshotFromSource(source = {}, preset = null) {
 }
 
 async function resolveWritingContext() {
+  if (MAINTENANCE_MODE) {
+    const localDraft = listLocalDrafts(state.user?.studentId || null)[0] || null;
+    const userId = localDraft?.userId || maintenanceLocalUserId();
+    return {
+      targetType: localDraft?.draftKey?.split(':')[0] || 'new',
+      targetId: null,
+      source: localDraft?.snapshot || {},
+      draft: null,
+      draftKey: localDraft?.draftKey || draftKeyFor('new'),
+      userId,
+      localOnly: true
+    };
+  }
   const current = route();
   const { drafts } = await api('/api/drafts/mine');
   state.drafts = drafts;
@@ -466,7 +512,7 @@ async function resolveWritingContext() {
 }
 
 async function contributePage() {
-  if (!state.user) {
+  if (!state.user && !MAINTENANCE_MODE) {
     shell(`<header class="page-heading"><span class="eyebrow">参与共建</span><h1>分享一段值得留下的经历</h1><p>无需 GitHub，也无需学习 Markdown。</p></header><div class="form-card empty"><p>登入后即可开始撰写；内容会自动保存为仅你可见的草稿。</p><button class="button primary" data-login>用学号登入</button></div>`);
     return;
   }
@@ -474,11 +520,11 @@ async function contributePage() {
   try {
     const context = await resolveWritingContext();
     const initial = snapshotFromSource(context.source, context.draft ? null : state.contributionPreset);
-    const title = context.isArticleEdit ? `编辑《${esc(initial.title)}》` : context.isReviewEdit ? `校订《${esc(initial.title)}》` : context.targetType === 'submission' ? '继续修改这份投稿' : '把经历写具体';
-    shell(`<header class="page-heading writing-heading"><span class="eyebrow">${context.isArticleEdit ? '管理已发布内容' : context.isReviewEdit ? '管理员校订待审核稿件' : context.targetType === 'submission' ? '修改后重新审核' : '自动保存的写作页'}</span><h1>${title}</h1><p>${context.isReviewEdit ? '修改会保存回原待审核稿件，并继续留在审核队列，不会自动发布。' : '直接写下内容即可。按 Enter 新建段落，输入 / 切换格式，系统会自动保存。'}</p></header>
+    const title = context.localOnly ? '本机写作页' : context.isArticleEdit ? `编辑《${esc(initial.title)}》` : context.isReviewEdit ? `校订《${esc(initial.title)}》` : context.targetType === 'submission' ? '继续修改这份投稿' : '把经历写具体';
+    shell(`<header class="page-heading writing-heading"><span class="eyebrow">${context.localOnly ? 'LOCAL WRITING MODE' : context.isArticleEdit ? '管理已发布内容' : context.isReviewEdit ? '管理员校订待审核稿件' : context.targetType === 'submission' ? '修改后重新审核' : '自动保存的写作页'}</span><h1>${title}</h1><p>${context.localOnly ? '编辑器可正常使用，内容只保存在当前浏览器；云端保存与提交将在维护结束后恢复。' : context.isReviewEdit ? '修改会保存回原待审核稿件，并继续留在审核队列，不会自动发布。' : '直接写下内容即可。按 Enter 新建段落，输入 / 切换格式，系统会自动保存。'}</p></header>
       <form class="writing-layout" id="contribution-form">
         <section class="writing-paper">
-          <div class="notice compact">学号只用于校内成员筛选和保存投稿记录，不会出现在公开内容或审核队列中。</div>
+          <div class="notice compact">${context.localOnly ? '本机编辑不会访问数据库。刷新后会自动恢复这台设备上最近保存的草稿；请勿清除浏览器网站数据。' : '学号只用于校内成员筛选和保存投稿记录，不会出现在公开内容或审核队列中。'}</div>
           <div class="writing-meta"><div class="form-grid"><label>投稿分区<select name="sectionSlug" required><option value="">请选择</option>${state.sections.map(section => `<option value="${esc(section.slug)}">${section.icon} ${esc(section.title)}</option>`).join('')}</select></label><label>内容类型<select name="contentType" required>${['访谈','评价','经验','指南'].map(type => `<option>${type}</option>`).join('')}</select></label></div>
           <label class="title-field"><span>标题</span><input name="title" maxlength="100" placeholder="给这段经历一个具体的标题" required></label>
           <label><span>一句话摘要</span><textarea name="summary" maxlength="240" placeholder="告诉读者背景、重点和适合谁阅读" required></textarea></label>
@@ -488,7 +534,7 @@ async function contributePage() {
           <div class="byline-panel"><div><label>署名<input name="authorLabel" maxlength="40" placeholder="例如：陈同学 / Chenrx"></label><label class="checkbox"><input type="checkbox" name="anonymous"> 公开时显示为“匿名同学”</label></div><aside class="credit-note"><strong>让名字和经验一起留下</strong><p>实名投稿通过审核后，署名会进入「致谢」。每个学号只记录第一次实名署名；匿名投稿不会受到区别审核。</p><a href="#/thanks">查看致谢板块 →</a></aside></div>
           <div class="notice warn">提交前请删除他人的联系方式、成绩、家庭情况等隐私。评价他人时，请描述事实与个人感受。</div>
         </section>
-        <aside class="writing-status"><div class="save-state" data-save-state="saved" aria-live="polite"><span class="save-dot"></span><strong data-save-message>准备自动保存</strong><small data-save-revision></small></div><dl class="writing-stats"><div><dt>正文字符</dt><dd data-character-count>0</dd></div><div><dt>内容块</dt><dd data-block-count>1</dd></div></dl><div class="conflict-panel" data-conflict-panel hidden><strong>发现另一个版本</strong><p>为了避免覆盖，自动保存已经暂停。</p><button type="button" class="button small" data-use-cloud>采用云端版本</button><button type="button" class="button small" data-keep-copy>保留为新草稿</button></div><button type="button" class="button" data-save-now>立即保存</button><button type="button" class="button" data-preview>预览文章</button><button class="button primary" type="submit">${context.isArticleEdit ? '保存公开文章' : context.isReviewEdit ? '保存并返回审核' : '提交审核'}</button><div class="draft-danger"><button type="button" class="button danger-quiet" data-delete-current-draft>删除这份草稿</button><small>清除本机与云端尚未提交的内容</small></div><p class="form-error" data-form-error></p></aside>
+        <aside class="writing-status"><div class="save-state" data-save-state="saved" aria-live="polite"><span class="save-dot"></span><strong data-save-message>准备自动保存</strong><small data-save-revision></small></div><dl class="writing-stats"><div><dt>正文字符</dt><dd data-character-count>0</dd></div><div><dt>内容块</dt><dd data-block-count>1</dd></div></dl><div class="conflict-panel" data-conflict-panel hidden><strong>发现另一个版本</strong><p>为了避免覆盖，自动保存已经暂停。</p><button type="button" class="button small" data-use-cloud>采用云端版本</button><button type="button" class="button small" data-keep-copy>保留为新草稿</button></div><button type="button" class="button" data-save-now>立即保存</button><button type="button" class="button" data-preview>预览文章</button><button class="button primary" type="submit">${context.isArticleEdit ? '保存公开文章' : context.isReviewEdit ? '保存并返回审核' : '提交审核'}</button><div class="draft-danger"><button type="button" class="button danger-quiet" data-delete-current-draft>删除这份草稿</button><small>${context.localOnly ? '只清除这台设备上的本机草稿' : '清除本机与云端尚未提交的内容'}</small></div><p class="form-error" data-form-error></p></aside>
         <dialog class="preview-dialog" id="preview-dialog"><div class="preview-head"><strong>投稿预览</strong><button type="button" class="icon-button" data-close-preview aria-label="关闭预览">×</button></div><article class="prose" id="preview-prose"></article></dialog>
         <dialog class="preview-dialog markdown-dialog" id="markdown-dialog"><div class="preview-head"><strong>Markdown 输入与输出</strong><button type="button" class="icon-button" data-markdown-close aria-label="关闭 Markdown 面板">×</button></div><p class="muted">支持标题、引用、列表、表格、公式、分隔线和安全的行内格式。分栏与折叠块会以 LHwiki 扩展代码块无损保留。</p><label>Markdown 正文<textarea class="markdown-source" data-markdown-source spellcheck="false"></textarea></label><div class="form-actions"><button type="button" class="button" data-markdown-export>从当前正文生成</button><button type="button" class="button" data-markdown-copy>复制</button><button type="button" class="button primary" data-markdown-import>导入并替换正文</button></div></dialog>
       </form>`);
@@ -534,14 +580,15 @@ function bindEditorExperience(context, initial) {
       manager?.update(collectSnapshot(form, editor));
     }
   });
-  const draftKey = context.draft?.draftKey || draftKeyFor(context.targetType, context.targetId);
+  const draftKey = context.draftKey || context.draft?.draftKey || draftKeyFor(context.targetType, context.targetId);
   manager = new DraftManager({
     api,
-    userId: state.user.studentId,
+    userId: context.userId || state.user.studentId,
     draftKey,
     targetType: context.targetType,
     targetId: context.targetId,
     draft: context.draft,
+    warnBeforeUnload: context.localOnly,
     onState: info => {
       const container = document.querySelector('[data-save-state]');
       if (!container) return;
@@ -578,17 +625,18 @@ function bindEditorExperience(context, initial) {
     manager.update(collectSnapshot(form, editor));
   });
   document.querySelector('[data-editor-insert]').addEventListener('click', () => editor.openCommandPalette(editor.element(editor.activeId)));
+  const markdownButton = document.querySelector('[data-markdown-open]');
   const markdownDialog = document.querySelector('#markdown-dialog');
-  const markdownSource = document.querySelector('[data-markdown-source]');
+  const markdownSource = markdownDialog.querySelector('[data-markdown-source]');
   const exportMarkdown = () => { markdownSource.value = blocksToMarkdown(editor.getBlocks()); };
-  document.querySelector('[data-markdown-open]').addEventListener('click', () => { exportMarkdown(); markdownDialog.showModal(); });
-  document.querySelector('[data-markdown-close]').addEventListener('click', () => markdownDialog.close());
-  document.querySelector('[data-markdown-export]').addEventListener('click', exportMarkdown);
-  document.querySelector('[data-markdown-copy]').addEventListener('click', async () => {
+  markdownButton.addEventListener('click', () => { exportMarkdown(); markdownDialog.showModal(); });
+  markdownDialog.querySelector('[data-markdown-close]').addEventListener('click', () => markdownDialog.close());
+  markdownDialog.querySelector('[data-markdown-export]').addEventListener('click', exportMarkdown);
+  markdownDialog.querySelector('[data-markdown-copy]').addEventListener('click', async () => {
     try { await navigator.clipboard.writeText(markdownSource.value); toast('Markdown 已复制'); }
     catch { markdownSource.select(); toast('无法自动复制，请使用系统复制命令'); }
   });
-  document.querySelector('[data-markdown-import]').addEventListener('click', () => {
+  markdownDialog.querySelector('[data-markdown-import]').addEventListener('click', () => {
     if (!confirm('导入会替换当前正文，并由自动保存记录新版本。是否继续？')) return;
     editor.setBlocks(parseMarkdown(markdownSource.value), { focus: true });
     const importedStats = editor.stats();
@@ -598,7 +646,12 @@ function bindEditorExperience(context, initial) {
     markdownDialog.close();
     toast('Markdown 已导入');
   });
-  document.querySelector('[data-save-now]').addEventListener('click', () => manager.saveNow());
+  document.querySelector('[data-save-now]').addEventListener('click', () => {
+    manager.update(collectSnapshot(form, editor));
+    manager.persistLocal();
+    if (context.localOnly) toast('已保存到这台设备；云端上传仍暂停');
+    else manager.saveNow();
+  });
   document.querySelector('[data-delete-current-draft]').addEventListener('click', async event => {
     if (!confirm('确定删除这份草稿吗？所有尚未提交的内容都会被清除，且无法恢复。')) return;
     const button = event.currentTarget;
@@ -606,7 +659,11 @@ function bindEditorExperience(context, initial) {
     button.disabled = true;
     errorElement.textContent = '';
     try {
-      await manager.remove();
+      if (context.localOnly) {
+        clearLocalDraft(context.userId, manager.draftKey);
+      } else {
+        await manager.remove();
+      }
       manager.destroy();
       state.activeDraftManager = null;
       state.activeEditor = null;
@@ -648,6 +705,11 @@ function bindEditorExperience(context, initial) {
     const errorElement = form.querySelector('[data-form-error]');
     errorElement.textContent = '';
     manager.update(collectSnapshot(form, editor));
+    if (context.localOnly) {
+      manager.persistLocal();
+      errorElement.textContent = '已保存到这台设备。云端上传与提交暂时关闭，预计 9 月 7 日恢复。';
+      return;
+    }
     try {
       const result = await manager.submit();
       state.editing = null;
@@ -679,15 +741,13 @@ function personCard(name, detail) {
 }
 
 function visitCounter() {
-  const total = Number.isSafeInteger(state.visitCount) ? state.visitCount.toLocaleString('zh-CN') : '—';
-  return `<aside class="visit-counter" aria-label="网站累计浏览量"><span>累计浏览</span><strong data-visit-count>${total}</strong><small>次 · 自 8 月 10 日起统计</small></aside>`;
+  return `<aside class="visit-counter" aria-label="网站访问统计状态"><span>访问统计</span><strong>已暂停</strong><small>为节省免费云资源点</small></aside>`;
 }
 
 function thanksPage() {
   const contributors = state.contributors.length
     ? state.contributors.map(item => personCard(item.displayName, '实名内容贡献者')).join('')
     : `<div class="credit-empty">第一位实名内容贡献者会从这里开始。匿名投稿仍会被同样认真地审核。</div>`;
-  queueMicrotask(() => void flushPendingVisits({ drain: true }).then(() => refreshVisitCount({ force: true })));
   return `<header class="page-heading thanks-heading"><span class="eyebrow">ACKNOWLEDGEMENTS</span><h1>谢谢每一个把经验留下的人</h1><p>网站由代码搭起，也由一篇篇具体的讲述真正完成。这里只记录投稿者主动选择公开的署名。</p></header>
     <section class="credit-section developer-credit"><div class="credit-intro"><span>01 / DEVELOPERS</span><h2>开发者</h2><p>负责网站构建、前后端开发、UI 设计与部署维护。</p></div><div class="credit-people">${personCard('Chenrx', '网站构建 · UI 设计 · 全栈开发')}</div></section>
     <section class="credit-section"><div class="credit-intro"><span>02 / WRITERS</span><h2>内容贡献者</h2><p>实名投稿经审核通过后，每个学号在这里留下一个名字，以第一次实名投稿署名为准。</p></div><div class="credit-people">${contributors}</div></section>
@@ -817,7 +877,7 @@ function renderBlocks(container, blocks = [], { anchors = false } = {}) {
       usedIds.add(id);
       element.id = id;
       element.classList.add('article-heading-anchor');
-      headings.push({ id, level, text: parseInlineMarkdown(block.text).map(part => part.text).join('') });
+       headings.push({ id, level, text: parseInlineMarkdown(block.text).map(part => part.text).join('') });
     }
   };
   const appendInline = (element, value) => {
@@ -1037,6 +1097,9 @@ async function render() {
     state.activeDraftManager = null;
     state.activeEditor = null;
   }
+  if (MAINTENANCE_MODE && ['mine', 'review', 'admin', 'admin-article-edit', 'admin-review-edit', 'teacher-submit'].includes(current.page)) {
+    return shell(maintenancePage());
+  }
   if (current.page === 'article') return articlePage(current.value);
   if (current.page === 'mine') return minePage();
   if (current.page === 'review') return reviewPage();
@@ -1051,7 +1114,6 @@ async function init() {
     const [bootstrap, session] = await Promise.all([loadBootstrap(), loadSession()]);
     applyBootstrap(bootstrap); state.user = session.user;
     window.addEventListener('hashchange', render); render();
-    void recordVisit();
   } catch (err) { app.innerHTML = errorView(`初始化失败：${err.message}`, true); }
 }
 

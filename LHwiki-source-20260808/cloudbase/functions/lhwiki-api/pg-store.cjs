@@ -28,18 +28,53 @@ function assertResult(result, operation) {
   return result?.data;
 }
 
-function createPgStore({ envId, apiKey, fetchImpl = globalThis.fetch, requestTimeoutMs = 8000 }) {
+function createPgStore({
+  envId,
+  apiKey,
+  fetchImpl = globalThis.fetch,
+  requestTimeoutMs = 8000,
+  requestLimit = Number(process.env.LHWIKI_PG_REQUEST_LIMIT || 60),
+  requestWindowMs = Number(process.env.LHWIKI_PG_REQUEST_WINDOW_MS || 60_000),
+  nowImpl = Date.now
+}) {
   if (!envId || !apiKey || typeof fetchImpl !== 'function') {
     throw new Error('CloudBase PostgreSQL HTTP configuration is unavailable');
   }
 
+  const budget = {
+    startedAt: nowImpl(),
+    count: 0,
+    limit: Number.isSafeInteger(requestLimit) && requestLimit > 0 ? requestLimit : 60,
+    windowMs: Number.isSafeInteger(requestWindowMs) && requestWindowMs > 0 ? requestWindowMs : 60_000
+  };
+
+  function reserveBudget() {
+    const timestamp = nowImpl();
+    if (timestamp - budget.startedAt >= budget.windowMs) {
+      budget.startedAt = timestamp;
+      budget.count = 0;
+    }
+    if (budget.count >= budget.limit) {
+      const failure = new Error('CloudBase PostgreSQL request budget exceeded');
+      failure.name = 'CloudBasePgError';
+      failure.code = 'PG_REQUEST_BUDGET_EXCEEDED';
+      failure.status = 503;
+      throw failure;
+    }
+    budget.count += 1;
+  }
+
   async function request(table, { method = 'GET', query = {}, body, prefer } = {}) {
     primaryKey(table);
+    reserveBudget();
     const url = new URL(`https://${envId}.api.tcloudbasegateway.com/v1/rdb/rest/${encodeURIComponent(table)}`);
     for (const [key, value] of Object.entries(query)) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
-    const maxAttempts = method === 'GET' ? 2 : 1;
+    // Never multiply a browser or function retry into more PostgreSQL calls.
+    // Transient failures are surfaced to the bounded caller, which preserves
+    // local drafts and lets a human retry deliberately.
+    const maxAttempts = 1;
     let response;
     let lastError;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -87,6 +122,7 @@ function createPgStore({ envId, apiKey, fetchImpl = globalThis.fetch, requestTim
       const failure = new Error('CloudBase PostgreSQL HTTP request failed');
       failure.name = 'CloudBasePgError';
       failure.code = String(data?.code || `HTTP_${response.status}`);
+      failure.status = response.status;
       throw failure;
     }
     return { data };
@@ -155,10 +191,10 @@ function createPgStore({ envId, apiKey, fetchImpl = globalThis.fetch, requestTim
     return assertResult(result, `Delete ${table}`) || [];
   }
 
-  async function queryDocuments(table, where = null, limit = 100) {
+  async function queryDocuments(table, where = null, limit = 100, select = '*') {
     const filters = encodeFilters(where);
     const result = await request(table, {
-      query: { select: '*', ...filters, limit }
+      query: { select, ...filters, limit }
     });
     return assertResult(result, `Query ${table}`) || [];
   }

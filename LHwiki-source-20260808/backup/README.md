@@ -1,6 +1,6 @@
 # LHwiki 自动备份
 
-此目录由 `cloudbase/backup-cloudbase.ps1` 写入，默认每天 03:30 运行并保留最近 30 份：
+此目录由 `cloudbase/backup-cloudbase.ps1` 在开发或发布前手动写入并保留最近 30 份。指定电脑如需每日 03:30 计划任务，使用 `cloudbase/setup-backup.ps1 -EnableScheduledTask`；不要在多台电脑同时启用，已存在的 `LHwiki-CloudBase-Backup` 任务无需删除：
 
 - `lhwiki-YYYYMMDD-HHmmss.json`：完整业务数据，包括仅用户本人可见的云端草稿。
 - 同名 `.sha256`：完整性校验值。
