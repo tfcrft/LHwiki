@@ -64,6 +64,8 @@ pnpm install
 pnpm test
 ```
 
+API 集成测试同样包含在 `pnpm test` 中，完全使用本地 HTTP、虚构账号和测试专用内存数据库，不需要 CloudBase 凭据。覆盖流程、测试结构和剩余风险见 [`API_INTEGRATION_TESTING.md`](API_INTEGRATION_TESTING.md)。
+
 Cloudflare 回退版本的本地开发命令和密钥样例仍保留在 `package.json`、`.dev.vars.example` 与 `wrangler.jsonc` 中。CloudBase 生产部署不要把服务器 API Key 写入源码、前端或 `.env` 文件。
 
 ## 自动备份

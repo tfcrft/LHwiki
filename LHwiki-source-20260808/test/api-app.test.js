@@ -65,6 +65,21 @@ test('injected maintenance configuration blocks private routes before store acce
     const blocked = await fetch(`${origin}/api/drafts/mine`);
     assert.equal(blocked.status, 503);
     assert.equal((await blocked.json()).maintenance, true);
+    const login = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin },
+      body: JSON.stringify({ studentId: '209900001' })
+    });
+    assert.equal(login.status, 503);
+    assert.equal((await login.json()).maintenance, true);
+    const session = await fetch(`${origin}/api/session`).then(response => response.json());
+    assert.deepEqual(session, { user: null, maintenance: true, reviewDate: '2099-12-31' });
+    const logout = await fetch(`${origin}/api/auth/logout`, { method: 'POST', headers: { origin } });
+    assert.equal(logout.status, 200);
+    assert.equal((await logout.json()).maintenance, true);
+    const bootstrap = await fetch(`${origin}/api/bootstrap`);
+    assert.equal(bootstrap.status, 200);
+    assert.deepEqual((await bootstrap.json()).sections, []);
   });
 });
 
