@@ -10,9 +10,14 @@ permissions:
 jobs:
   node-tests:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: LHwiki-source-20260808
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm test
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test

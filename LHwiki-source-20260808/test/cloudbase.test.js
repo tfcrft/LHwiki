@@ -258,8 +258,8 @@ test('legacy editor tabs are rejected before authentication or PostgreSQL access
   const source = await readApiSource();
   const guard = source.indexOf('if (isDraftWrite)');
   const draftRoute = source.indexOf("if (method === 'POST' && path === '/api/drafts')");
-  const guardEnd = source.indexOf("\n\n  if (method === 'GET'", guard);
-  assert.ok(guard > 0 && draftRoute > guard);
+  const guardEnd = source.indexOf("if (method === 'GET' && path === '/api/session')", guard);
+  assert.ok(guard > 0 && guardEnd > guard && draftRoute > guard);
   const guardSource = source.slice(guard, guardEnd);
   assert.match(guardSource, /!Number\.isSafeInteger\(Number\(data\?\.clientVersion\)\)/);
   assert.match(guardSource, /Number\(data\.clientVersion\) < draftClientVersion/);
