@@ -26,7 +26,7 @@ async function probe(origin, path, expectation) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     if (expectation === 'html' && !/<html/i.test(body)) throw new Error('HTML document missing');
     if (expectation === 'script' && body.length < 100) throw new Error('static asset unexpectedly short');
-    if (path === '/api/health' && (!body?.ok || body?.database !== 'ready')) throw new Error('database is not ready');
+    if (path.startsWith('/api/health') && (!body?.ok || body?.database !== 'deferred')) throw new Error('health response is invalid');
     if (path === '/api/bootstrap' && (!Array.isArray(body?.sections) || !Array.isArray(body?.articles))) throw new Error('bootstrap shape invalid');
     if (path === '/api/session' && !Object.hasOwn(body || {}, 'user')) throw new Error('session shape invalid');
     const durationMs = Math.round(performance.now() - started);

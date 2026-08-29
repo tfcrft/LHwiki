@@ -6,6 +6,15 @@ import test from 'node:test';
 const require = createRequire(import.meta.url);
 const cloudbaseContent = require('../cloudbase/functions/lhwiki-api/content.cjs');
 const { PRIMARY_KEYS, createPgStore } = require('../cloudbase/functions/lhwiki-api/pg-store.cjs');
+const { fromBackup, loadPublicSnapshot, validatePublicSnapshot } = require('../cloudbase/functions/lhwiki-api/public-snapshot.cjs');
+
+async function readApiSource() {
+  const [app, server] = await Promise.all([
+    readFile(new URL('../cloudbase/functions/lhwiki-api/api-app.cjs', import.meta.url), 'utf8'),
+    readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8')
+  ]);
+  return `${app}\n${server}`;
+}
 
 test('CloudBase 后端沿用相同的登入规则', () => {
   assert.equal(cloudbaseContent.validLoginId('202600043'), true);
@@ -15,11 +24,11 @@ test('CloudBase 后端沿用相同的登入规则', () => {
 });
 
 test('普通学生登入不会把学号扫描放大为数据库写入', async () => {
-  const source = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+  const source = await readApiSource();
   assert.match(source, /if \(!origin\) return false/);
   assert.match(source, /if \(studentId === ADMIN_LOGIN_ID\) await setDocument\('users', studentId, user\)/);
   assert.match(source, /enforceMutationRate\(request, 'login-sustained', 60, 15 \* 60_000\)/);
-  assert.match(source, /return stored \|\| \{/);
+  assert.match(source, /return stored \? \{ \.\.\.stored, __persistent: true \} : \{/);
   assert.doesNotMatch(source, /\n\s*await setDocument\('users', studentId, user\);/);
   assert.match(source, /async function ensurePersistentUser\(user\)/);
   assert.match(source, /auth\.user = await ensurePersistentUser\(auth\.user\)/);
@@ -48,14 +57,53 @@ test('CloudBase PostgreSQL adapter defines a stable primary key for every table'
   });
 });
 
-test('visit counter batches page opens while preserving the full total', async () => {
-  const server = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+test('public snapshot is strictly allowlisted and excludes private backup tables/fields', () => {
+  const snapshot = fromBackup({
+    formatVersion: 1,
+    exportedAt: '2026-08-22T00:00:00.000Z',
+    data: {
+      sections: [{ slug: 'start', title: '初来潞园', description: '描述', icon: '门', sort_order: 10, private_note: '不要公开' }],
+      articles: [{ slug: 'welcome', section_slug: 'start', title: '欢迎', summary: '这是一段足够长的摘要', content_type: '说明', subject: 'LHwiki', author_label: '编写组', published_at: '2026-08-07', updated_at: '2026-08-07', body_json: '[{"type":"paragraph","text":"公开正文"}]', source_submission_id: 'private-submission' }],
+      contributors: [{ student_id: '202600043', display_name: '同学', approved_at: '2026-08-08', first_named_at: '2026-08-07' }, { student_id: '202600044', display_name: '未公开', approved_at: null }],
+      teacher_additions: [{ id: 'teacher-1', name: '李老师', subject: '语文', motto: '格言', approved_at: '2026-08-09', student_id: 'private' }]
+    }
+  });
+  assert.deepEqual(Object.keys(snapshot.articles[0]).sort(), ['author_label', 'body', 'content_type', 'published_at', 'section_slug', 'subject', 'summary', 'title', 'updated_at', 'slug'].sort());
+  assert.deepEqual(snapshot.contributors, [{ displayName: '同学', since: '2026-08-08' }]);
+  assert.equal(snapshot.teacherAdditions[0].id, 'teacher-1');
+  assert.throws(() => validatePublicSnapshot({ ...snapshot, articles: [{ ...snapshot.articles[0], private: true }] }), /unapproved field/);
+});
+
+test('public seed fallback is independent from private migration data', () => {
+  const snapshot = loadPublicSnapshot({
+    snapshotPath: new URL('../cloudbase/functions/lhwiki-api/public-snapshot-does-not-exist.json', import.meta.url),
+    seedPath: new URL('../cloudbase/functions/lhwiki-api/seed-data.json', import.meta.url)
+  });
+  assert.ok(snapshot.articles.length > 0);
+  assert.ok(snapshot.articles.every(article => Array.isArray(article.body)));
+});
+
+test('PostgreSQL adapter opens a 503 circuit at the per-instance request budget', async () => {
+  let calls = 0;
+  const store = createPgStore({
+    envId: 'example-env', apiKey: 'server-key', requestLimit: 2,
+    fetchImpl: async () => { calls += 1; return { ok: true, status: 200, text: async () => '[]' }; }
+  });
+  await store.queryDocuments('sections');
+  await store.queryDocuments('sections');
+  await assert.rejects(() => store.queryDocuments('sections'), error => error.code === 'PG_REQUEST_BUDGET_EXCEEDED' && error.status === 503);
+  assert.equal(calls, 2);
+});
+
+test('low-resource mode pauses decorative visit writes', async () => {
+  const server = await readApiSource();
   const client = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
   const migration = await readFile(new URL('../cloudbase/migrations/20260809230000_add_site_visit_counter.sql', import.meta.url), 'utf8');
   assert.match(server, /path === '\/api\/visits'/);
-  assert.match(server, /setDocument\('site_visit_events', visitId/);
+  assert.match(server, /const VISIT_TRACKING_ENABLED = false/);
+  assert.match(server, /if \(!visitTrackingEnabled\) return result\(\{ trackingStartedAt: '2026-08-10', counted: false, paused: true \}\)/);
   assert.match(server, /VISIT_TRACKING_START/);
-  assert.match(client, /void recordVisit\(\)/);
+  assert.doesNotMatch(client, /\n\s*void recordVisit\(\);/);
   assert.match(client, /VISIT_FLUSH_DELAY = 20_000/);
   assert.match(client, /VISIT_BATCH_MAX = 20/);
   assert.match(client, /localStorage\.setItem\(VISIT_PENDING_KEY, String\(readPendingVisits\(\) \+ 1\)\)/);
@@ -63,32 +111,42 @@ test('visit counter batches page opens while preserving the full total', async (
   assert.doesNotMatch(client, /VISIT_DAY_KEY/);
   assert.match(server, /enforceMutationRate\(request, 'visit-sustained', 600, 15 \* 60_000\)/);
   assert.doesNotMatch(server, /return result\(\{ total: await readVisitCount\(\), trackingStartedAt: '2026-08-10', counted: true \}\)/);
-  assert.match(client, /自 8 月 10 日起统计/);
+  assert.match(client, /为节省免费云资源点/);
   assert.match(migration, /visit_id varchar\(96\) PRIMARY KEY/);
   assert.match(migration, /visit_count integer NOT NULL DEFAULT 1 CHECK \(visit_count BETWEEN 1 AND 20\)/);
   assert.match(migration, /ON CONFLICT \(key\).*total = site_stats\.total \+ NEW\.visit_count/s);
   assert.match(server, /visit_count: visitCount/);
 });
 
-test('public browsing favors browser and warm-instance caches', async () => {
-  const server = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+test('public browsing uses long caches and avoids routine database wakeups', async () => {
+  const server = await readApiSource();
   const client = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
-  assert.match(client, /const BOOTSTRAP_TTL = 15 \* 60_000/);
+  assert.match(client, /const BOOTSTRAP_TTL = 6 \* 60 \* 60_000/);
+  assert.match(client, /const SESSION_TTL = 12 \* 60 \* 60_000/);
   assert.match(client, /readCache\(localStorage, BOOTSTRAP_CACHE_KEY, BOOTSTRAP_TTL\)/);
   assert.match(client, /await import\('\.\/teachers\.js\?v=20260810-directory-supplement-2'\)/);
   assert.match(client, /readCache\(sessionStorage, SESSION_CACHE_KEY, SESSION_TTL\)/);
   assert.match(client, /Promise\.all\(\[loadBootstrap\(\), loadSession\(\)\]\)/);
-  assert.match(server, /const PUBLIC_CACHE_TTL = 2 \* 60_000/);
+  assert.match(server, /const PUBLIC_CACHE_TTL = 6 \* 60 \* 60_000/);
+  assert.match(server, /const ARTICLE_CACHE_TTL = 6 \* 60 \* 60_000/);
+  assert.match(server, /let publicCachePromise = null/);
+  assert.match(server, /loadPublicSnapshot/);
+  assert.match(server, /const publicSnapshot = loadPublicSnapshot/);
+  assert.match(server, /async function readPublicArticle\(slug\)/);
   assert.match(server, /async function readPublicBootstrap\(\)/);
   assert.match(server, /articles: articles\.map\(mapArticleSummary\)/);
-  assert.match(server, /const \{ body_json, \.\.\.summary \} = clean/);
-  assert.match(server, /if \(publicCache && Date\.now\(\) - publicCache\.savedAt < PUBLIC_CACHE_TTL\)/);
+  assert.match(server, /const \{ body_json, body, \.\.\.summary \} = clean/);
+  assert.match(server, /if \(publicCache && clock\(\) - publicCache\.savedAt < PUBLIC_CACHE_TTL\)/);
   assert.match(server, /invalidatePublicCache\(\)/);
-  assert.match(server, /max-age=300, stale-while-revalidate=3600/);
+  assert.match(server, /max-age=21600, stale-while-revalidate=604800/);
+  assert.match(server, /database: emergencyMaintenance \? 'suspended-by-application' : 'deferred'/);
+  assert.doesNotMatch(server, /path === '\/api\/bootstrap'[\s\S]{0,1000}queryDocuments/);
+  assert.doesNotMatch(server, /path\.startsWith\('\/api\/articles\/'\)[\s\S]{0,400}getDocument/);
+  assert.doesNotMatch(server, /\n\s*await ensureSeed\(\);\n\n\s*if \(method === 'GET' && path === '\/api\/visits'/);
 });
 
 test('teacher additions use a moderated request before entering the public index', async () => {
-  const server = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+  const server = await readApiSource();
   const client = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
   assert.match(server, /path === '\/api\/teacher-submissions'/);
   assert.match(server, /requireUser\(request\)/);
@@ -116,10 +174,10 @@ test('known teacher names guard against duplicate community additions', () => {
 });
 
 test('致谢板块只公开显示名，不需要把学号发送到前端', async () => {
-  const source = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
-  assert.match(source, /displayName: item\.display_name/);
-  assert.match(source, /filter\(item => item\.approved_at\)/);
-  assert.doesNotMatch(source, /displayName: item\.display_name, studentId/);
+  const source = await readApiSource();
+  assert.match(source, /contributors: contributors\.sort/);
+  assert.match(source, /displayName/);
+  assert.doesNotMatch(source, /studentId: item\.student_id/);
 });
 
 test('CloudBase PostgreSQL adapter uses the documented REST endpoint and bearer key', async () => {
@@ -150,7 +208,7 @@ test('CloudBase PostgreSQL adapter uses the documented REST endpoint and bearer 
   assert.match(calls[5].url, /student_id=eq\.202600043/);
 });
 
-test('CloudBase PostgreSQL adapter bounds requests and retries only safe reads', async () => {
+test('CloudBase PostgreSQL adapter bounds requests without retry multiplication', async () => {
   let readCalls = 0;
   const readStore = createPgStore({
     envId: 'example-env',
@@ -163,8 +221,8 @@ test('CloudBase PostgreSQL adapter bounds requests and retries only safe reads',
       return { ok: true, status: 200, text: async () => '[]' };
     }
   });
-  await readStore.queryDocuments('sections');
-  assert.equal(readCalls, 2);
+  await assert.rejects(() => readStore.queryDocuments('sections'), error => error.status === 503 && /CloudBase PostgreSQL HTTP request failed/.test(error.message));
+  assert.equal(readCalls, 1);
 
   let writeCalls = 0;
   const writeStore = createPgStore({
@@ -179,21 +237,80 @@ test('CloudBase PostgreSQL adapter bounds requests and retries only safe reads',
   assert.equal(writeCalls, 1);
 });
 
-test('health endpoint verifies PostgreSQL instead of reporting a false healthy state', async () => {
-  const source = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
-  const healthRoute = source.slice(source.indexOf("path === '/api/health'"), source.indexOf('await ensureSeed()'));
-  assert.match(healthRoute, /await queryDocuments\('sections', null, 1\)/);
-  assert.match(healthRoute, /database: 'ready'/);
+test('browser does not multiply cloud function retries in low-resource mode', async () => {
+  const client = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
+  assert.match(client, /const maxAttempts = 1/);
+  assert.doesNotMatch(client, /const maxAttempts = method === 'GET' \? 2 : 1/);
+});
+
+test('low-resource writing mode never schedules automatic cloud writes', async () => {
+  const source = await readFile(new URL('../public/draft-manager.js', import.meta.url), 'utf8');
+  assert.match(source, /const DRAFT_CLIENT_VERSION = 3/);
+  assert.doesNotMatch(source, /SAVE_DELAY|RETRY_DELAYS/);
+  assert.doesNotMatch(source, /setTimeout\(\(\) => this\.saveNow/);
+  assert.match(source, /this\.trailingSaveRequested = false/);
+  assert.match(source, /this\.autoRetryBlocked = false/);
+  assert.match(source, /\[429, 503\]\.includes\(error\?\.status\)/);
+  assert.match(source, /云端需手动保存/);
+});
+
+test('legacy editor tabs are rejected before authentication or PostgreSQL access', async () => {
+  const source = await readApiSource();
+  const guard = source.indexOf('if (isDraftWrite)');
+  const draftRoute = source.indexOf("if (method === 'POST' && path === '/api/drafts')");
+  const guardEnd = source.indexOf("if (method === 'GET' && path === '/api/session')", guard);
+  assert.ok(guard > 0 && guardEnd > guard && draftRoute > guard);
+  const guardSource = source.slice(guard, guardEnd);
+  assert.match(guardSource, /!Number\.isSafeInteger\(Number\(data\?\.clientVersion\)\)/);
+  assert.match(guardSource, /Number\(data\.clientVersion\) < draftClientVersion/);
+  assert.match(guardSource, /upgradeRequired: true/);
+  assert.doesNotMatch(guardSource, /requireUser|getDocument|queryDocuments|setDocument/);
+});
+
+test('public bootstrap excludes full article bodies from database list reads', async () => {
+  const store = await readFile(new URL('../cloudbase/functions/lhwiki-api/pg-store.cjs', import.meta.url), 'utf8');
+  const server = await readApiSource();
+  assert.match(store, /queryDocuments\(table, where = null, limit = 100, select = '\*'\)/);
+  assert.match(server, /const articles = publicSnapshot\.articles/);
+  assert.doesNotMatch(server, /queryDocuments\('articles'/);
+});
+
+test('routine and deep health are always database-free', async () => {
+  const source = await readApiSource();
+  const start = source.indexOf("if (method === 'GET' && path === '/api/health')");
+  const end = source.indexOf("if (method === 'GET' && path === '/api/visits')", start);
+  const healthRoute = source.slice(start, end);
+  assert.doesNotMatch(healthRoute, /searchParams/);
+  assert.doesNotMatch(healthRoute, /queryDocuments|getDocument|ensureSeed/);
+  assert.match(healthRoute, /suspended-by-application/);
+});
+
+test('emergency maintenance keeps private and mutation routes away from PostgreSQL', async () => {
+  const server = await readApiSource();
+  const client = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
+  assert.match(server, /const EMERGENCY_MAINTENANCE = true/);
+  const publicArticle = server.indexOf("path.startsWith('/api/articles/')");
+  const gate = server.indexOf('if (emergencyMaintenance) {', publicArticle);
+  const legacyDraftGuard = server.indexOf('const isDraftWrite', gate);
+  assert.ok(publicArticle > 0 && gate > publicArticle && legacyDraftGuard > gate);
+  const gateSource = server.slice(gate, legacyDraftGuard);
+  assert.match(gateSource, /maintenance: true/);
+  assert.match(gateSource, /}, 503/);
+  assert.doesNotMatch(gateSource, /getDocument|queryDocuments|setDocument|deleteDocument|requireUser/);
+  assert.match(client, /const MAINTENANCE_MODE = true/);
+  assert.match(client, /网站近期运行不稳定，暂时停用云端上传/);
+  assert.match(client, /预计于 \$\{MAINTENANCE_REVIEW_DATE\} 恢复/);
+  assert.match(client, /readCache\(sessionStorage, SESSION_CACHE_KEY, SESSION_TTL\) \|\| \{ user: null, maintenance: true \}/);
 });
 
 test('in-memory mutation limiter has an absolute bucket cap', async () => {
-  const source = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+  const source = await readApiSource();
   assert.match(source, /while \(mutationWindows\.size > 2500\)/);
   assert.match(source, /mutationWindows\.delete\(mutationWindows\.keys\(\)\.next\(\)\.value\)/);
 });
 
 test('draft routes require ownership and optimistic revisions', async () => {
-  const source = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+  const source = await readApiSource();
   assert.match(source, /path === '\/api\/drafts\/mine'/);
   assert.match(source, /revision: expectedRevision/);
   assert.match(source, /status: 409|}, 409\)/);
@@ -203,6 +320,11 @@ test('draft routes require ownership and optimistic revisions', async () => {
   assert.match(source, /containsAdvancedBlocks\(target\.sourceBody \|\| \[\]\)/);
   assert.match(source, /upgradeRequired: true/);
   assert.match(source, /snapshot\?\.schemaVersion/);
+});
+
+test('legacy autosave tabs are capped to six cloud revisions per hour', async () => {
+  const source = await readApiSource();
+  assert.match(source, /enforceMutationRate\(request, 'draft-save', 6, 60 \* 60_000\)/);
 });
 
 test('CloudBase content parser counts nested advanced content for submission limits', () => {
@@ -215,7 +337,7 @@ test('CloudBase content parser counts nested advanced content for submission lim
 });
 
 test('受保护管理员不能被权限接口降权，并拥有已发布文章管理接口', async () => {
-  const source = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+  const source = await readApiSource();
   assert.match(source, /studentId === ADMIN_LOGIN_ID/);
   assert.match(source, /受保护的站点管理员不能被降权或覆盖/);
   assert.match(source, /adminArticleMatch && \['PUT', 'DELETE'\]\.includes\(method\)/);
@@ -224,7 +346,7 @@ test('受保护管理员不能被权限接口降权，并拥有已发布文章�
 });
 
 test('管理员可以校订待审核稿件但不会绕过审核或改变投稿归属', async () => {
-  const server = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+  const server = await readApiSource();
   const client = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
   const migration = await readFile(new URL('../cloudbase/migrations/20260811022500_allow_admin_review_edits.sql', import.meta.url), 'utf8');
   assert.match(server, /submission\.student_id === user\.student_id \|\| user\.role === 'admin'/);
@@ -238,7 +360,7 @@ test('管理员可以校订待审核稿件但不会绕过审核或改变投稿�
 });
 
 test('公开文章读取不缓存旧正文，管理员保存后刷新仍保持更新', async () => {
-  const server = await readFile(new URL('../cloudbase/functions/lhwiki-api/server.js', import.meta.url), 'utf8');
+  const server = await readApiSource();
   const client = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
   assert.doesNotMatch(server, /max-age=300, stale-while-revalidate=600/);
   assert.match(client, /api\(`\/api\/articles\/\$\{encodeURIComponent\(slug\)\}\$\{cacheBust\}`, \{ cache: 'no-store' \}\)/);

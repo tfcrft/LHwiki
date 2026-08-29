@@ -1,6 +1,6 @@
 {
   "name": "campus-notes",
-  "version": "0.8.1",
+  "version": "0.8.6",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,7 @@
     "deploy": "wrangler deploy",
     "db:local": "wrangler d1 execute campus-notes-db --local --file=./schema.sql",
     "db:remote": "wrangler d1 execute campus-notes-db --remote --file=./schema.sql",
-    "test": "node --test \"test/*.test.js\"",
+    "test": "node scripts/run-tests.mjs",
     "stability:check": "node scripts/stability-check.mjs",
     "smoke:functional": "node scripts/functional-smoke.mjs"
   },
