@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { BlockEditor, addTableRow, cloneBlockTree, filterCommands, mergeBlocks, normalizeBlocks, setCaret, splitBlock, tableTabTarget } from '../public/editor.js';
+import { BlockEditor, addTableRow, cloneBlockTree, contentNodeCount, filterCommands, mergeBlocks, normalizeBlocks, setCaret, splitBlock, tableTabTarget } from '../public/editor.js';
 import { DraftManager, draftKeyFor } from '../public/draft-manager.js';
 import { blocksToMarkdown, codeFence, parseInlineMarkdown, parseMarkdown } from '../public/markdown.js';
+import { importDocument, parseLatexDocument } from '../public/document-import.js';
 
 test('editor normalizes legacy blocks and preserves structured headings', () => {
   const blocks = normalizeBlocks([
@@ -184,6 +185,66 @@ test('Markdown maps onto the v0.8 editor schema without adding server block type
   assert.equal(blocks[7].text, 'x^2');
 });
 
+test('native format blocks and inline formulas round-trip through Markdown', () => {
+  const source = '- [x] 已完成\n\n> [!NOTE]\n> 请注意\n\n```js\nconst safe = true;\n```\n\n质能关系 $E=mc^2$';
+  const blocks = parseMarkdown(source);
+  assert.deepEqual(blocks.map(block => block.type), ['task', 'callout', 'code', 'paragraph']);
+  assert.equal(blocks[0].checked, true);
+  assert.equal(blocks[2].language, 'js');
+  assert.equal(parseInlineMarkdown(blocks[3].text).at(-1).type, 'formula');
+  assert.deepEqual(parseMarkdown(blocksToMarkdown(blocks)).map(block => block.type), ['task', 'callout', 'code', 'paragraph']);
+});
+
+test('Markdown chooses a longer fence when code contains triple backticks', () => {
+  const original = [{ type: 'code', language: 'md', text: 'before\n```\nafter' }];
+  const markdown = blocksToMarkdown(original);
+  assert.match(markdown, /^````md/m);
+  const restored = parseMarkdown(markdown)[0];
+  assert.equal(restored.type, 'code');
+  assert.equal(restored.text, original[0].text);
+});
+
+test('Markdown preserves multiline native list and heading blocks', () => {
+  const original = [{ type: 'task', checked: true, text: '第一行\n第二行' }, { type: 'heading', text: '标题\n副题' }];
+  const restored = parseMarkdown(blocksToMarkdown(original));
+  assert.deepEqual(restored.map(block => [block.type, block.text]), [['task', '第一行\n第二行'], ['heading', '标题\n副题']]);
+  assert.equal(restored[0].checked, true);
+});
+
+test('document import accepts structured-only content and counts nested blocks', async () => {
+  const structured = blocksToMarkdown([{ type: 'columns', columns: [[{ type: 'paragraph', text: '左' }], [{ type: 'paragraph', text: '右' }]] }]);
+  const result = await importDocument({ format: 'markdown', source: structured });
+  assert.equal(result.blocks[0].type, 'columns');
+  assert.equal(result.stats.blocks, 3);
+  assert.equal(result.stats.characters, 2);
+});
+
+test('editor applies one shared 400-node budget to nested imported content', () => {
+  const rows = Array.from({ length: 30 }, () => Array(10).fill('值'));
+  const blocks = normalizeBlocks(Array.from({ length: 3 }, () => ({ type: 'table', rows })));
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks.truncated, true);
+  assert.equal(contentNodeCount(blocks), 301);
+});
+
+test('LaTeX documents map sections and display equations to native blocks', () => {
+  const blocks = parseLatexDocument('\\section{概述}\n\n正文\n\n\\[\\frac{1}{2}\\]\n\n\\subsection{细节}');
+  assert.deepEqual(blocks.map(block => block.type), ['heading', 'paragraph', 'formula', 'subheading']);
+  assert.equal(blocks[2].text, '\\frac{1}{2}');
+});
+
+test('LaTeX imports common equation environments and inline math', () => {
+  const blocks = parseLatexDocument('正文 \\(x+1\\)\n\n\\begin{align}a&=b\\\\c&=d\\end{align}');
+  assert.deepEqual(blocks.map(block => block.type), ['paragraph', 'formula', 'formula']);
+  assert.equal(blocks[0].text, '正文 $x+1$');
+  assert.equal(blocks[1].text, 'a=b');
+});
+
+test('LaTeX imports standard list environments as native lists', () => {
+  const blocks = parseLatexDocument('\\begin{itemize}\n\\item 甲\n\\item 乙\n\\end{itemize}');
+  assert.deepEqual(blocks.map(block => [block.type, block.text]), [['bullet', '甲'], ['bullet', '乙']]);
+});
+
 test('Markdown round-trip preserves columns and toggles through bounded LHwiki blocks', () => {
   const original = normalizeBlocks([
     { type: 'columns', columns: [[{ type: 'paragraph', text: '左栏' }], [{ type: 'formula', text: 'a+b' }]] },
@@ -200,6 +261,9 @@ test('Markdown inline parsing keeps links protocol-bound and code fences inert',
   assert.deepEqual(parseInlineMarkdown('**粗体**、*斜体*、~~删除~~、`代码`、[官网](https://luhe.net/)').map(part => part.type), ['strong', 'text', 'emphasis', 'text', 'strike', 'text', 'code', 'text', 'link']);
   assert.equal(parseInlineMarkdown('[危险](javascript:alert(1))')[0].type, 'text');
   assert.deepEqual(codeFence('```js\nalert(1)\n```'), { language: 'js', code: 'alert(1)' });
+  assert.equal(parseInlineMarkdown('价格 $100 到 $200')[0].type, 'text');
+  assert.deepEqual(parseInlineMarkdown('\\*字面星号\\*').map(part => part.text).join(''), '*字面星号*');
+  assert.equal(parseMarkdown('$$E=mc^2$$')[0].type, 'formula');
 });
 
 test('duplicating containers recursively assigns unique block ids', () => {
@@ -254,9 +318,11 @@ test('editor studio keeps one restrained entry point and a narrow-screen overflo
   assert.match(app, /published-toggle/);
   assert.match(css, /\.editor-table-scroll, \.published-table-scroll[^}]+overflow-x: auto/s);
   assert.match(css, /@media \(max-width: 620px\)[\s\S]+\.editor-columns, \.published-columns \{ grid-template-columns: 1fr; \}/);
-  assert.match(html, /20260815-dark-markdown-2/);
+  assert.match(html, /20260829-native-formats/);
   assert.match(app, /draft-manager\.js\?v=20260813-editor-studio/);
-  assert.match(app, /data-markdown-open/);
+  assert.match(app, /data-document-format/);
+  assert.match(app, /data-document-analyze/);
+  assert.match(app, /editorutility/);
   assert.match(html, /theme\.js\?v=20260815-dark-mode/);
   assert.match(css, /:root\[data-theme-effective="dark"\]/);
   assert.match(theme, /prefers-color-scheme: dark/);
